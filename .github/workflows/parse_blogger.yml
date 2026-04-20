@@ -1,16 +1,22 @@
-name: Parse Blogger
+name: Parse Blogger Articles
 
 on:
   schedule:
     - cron: '0 */6 * * *'   # каждые 6 часов
-  workflow_dispatch:         # возможность запустить вручную
+  workflow_dispatch:         # ручной запуск
+
+permissions:
+  contents: write            # ✅ даём права на запись в репозиторий
 
 jobs:
   parse:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -18,7 +24,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install -r requirements.txt
 
       - name: Run parser
         run: python blogger_parser.py
@@ -26,7 +32,7 @@ jobs:
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "actions@github.com"
           git add articles.json
           git diff --staged --quiet || git commit -m "Automated update of articles.json"
-          git push
+          git push origin main
