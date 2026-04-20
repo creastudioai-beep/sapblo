@@ -1,195 +1,189 @@
-# blogger_parser.py
 import requests
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 import json
-import time
 import re
-from urllib.parse import urljoin
 from datetime import datetime
+from html import unescape
 
 # ========== НАСТРОЙКИ ==========
 BLOG_URL = 'https://sochi-autoparts.blogspot.com'
 OUTPUT_FILE = 'articles.json'
-REQUEST_DELAY = 1.0          # секунд между запросами статей
-SITEMAP_DELAY = 0.5          # между запросами страниц sitemap
-MAX_ARTICLES = None          # ограничить количество (None = все)
+REQUEST_DELAY = 1.0  # секунд между запросами (если нужна пагинация)
+MAX_ARTICLES = None  # ограничить количество (None = все)
 # ===============================
 
 def get_article_urls_from_rss():
-    """Получает до 150 последних URL статей через RSS."""
-    rss_url = f"{BLOG_URL}/feeds/posts/default?max-results=150&alt=rss"
-    print(f"📡 Получаем статьи через RSS: {rss_url}")
+    """Получает список статей из RSS-фида Blogger."""
+    rss_url = f"{BLOG_URL}/feeds/posts/default?alt=rss&max-results=150"
+    print(f"📡 Загружаем RSS: {rss_url}")
     try:
         resp = requests.get(rss_url, timeout=10)
         if resp.status_code != 200:
             print(f"   Ошибка RSS: {resp.status_code}")
             return []
+        
         # Парсим XML
-        soup = BeautifulSoup(resp.text, 'xml')
-        links = soup.find_all('link')
-        urls = []
-        for link in links:
-            href = link.get('href')
-            if href and '/post/' in href and href not in urls:
-                urls.append(href)
-        print(f"   ✅ Найдено {len(urls)} статей в RSS")
-        return urls
+        root = ET.fromstring(resp.content)
+        # Пространства имён
+        ns = {'': 'http://www.w3.org/2005/Atom', 'media': 'http://search.yahoo.com/mrss/'}
+        # Ищем все элементы item (в RSS они называются entry, но Blogger возвращает Atom)
+        # Уточним: Blogger RSS возвращает <item> внутри <channel>, но в Atom формате.
+        # Проще: ищем все элементы с тегом item (в пространстве имён по умолчанию)
+        items = root.findall('.//item')
+        if not items:
+            # Если нет, пробуем найти entry (Atom)
+            items = root.findall('.//entry')
+        
+        articles = []
+        for item in items:
+            # Заголовок
+            title_elem = item.find('title')
+            title = title_elem.text if title_elem is not None else 'Без заголовка'
+            # Ссылка
+            link_elem = item.find('link')
+            link = link_elem.get('href') if link_elem is not None else None
+            if not link:
+                # Иногда ссылка в элементе <id>
+                id_elem = item.find('id')
+                if id_elem is not None and id_elem.text:
+                    link = id_elem.text
+            # Дата публикации
+            pub_date_elem = item.find('pubDate')
+            if pub_date_elem is not None and pub_date_elem.text:
+                # Парсим дату в формате RFC 822
+                try:
+                    pub_date = datetime.strptime(pub_date_elem.text, '%a, %d %b %Y %H:%M:%S %z')
+                    date_str = pub_date.isoformat()
+                except:
+                    date_str = datetime.now().isoformat()
+            else:
+                date_str = datetime.now().isoformat()
+            # Описание (содержимое статьи) – в элементе description
+            desc_elem = item.find('description')
+            content_html = desc_elem.text if desc_elem is not None else ''
+            if content_html:
+                # Раскодируем HTML-сущности (например, &lt; -> <)
+                content_html = unescape(content_html)
+            # Изображение: сначала пробуем media:thumbnail
+            thumb_elem = item.find('media:thumbnail', ns)
+            thumbnail = None
+            if thumb_elem is not None:
+                thumbnail = thumb_elem.get('url')
+            else:
+                # Пробуем найти первое изображение в description
+                img_match = re.search(r'<img[^>]+src="([^">]+)"', content_html)
+                if img_match:
+                    thumbnail = img_match.group(1)
+            
+            # Формируем запись
+            articles.append({
+                'id': f"blogger_{link.split('/')[-2] if link else 'unknown'}",
+                'source': 'blogger',
+                'title': title,
+                'date': date_str,
+                'content': content_html,
+                'telegraph_url': link,
+                'thumbnail': thumbnail,
+                'description': content_html[:200] if content_html else title
+            })
+        print(f"   ✅ Найдено {len(articles)} статей в RSS")
+        return articles
     except Exception as e:
-        print(f"   ❌ Ошибка RSS: {e}")
+        print(f"   ❌ Ошибка при загрузке RSS: {e}")
         return []
 
-def get_article_urls_from_sitemap():
-    """Получает URL статей через sitemap.xml (постранично)."""
-    urls = []
+def get_all_article_urls():
+    """Получает все статьи из RSS (с пагинацией, если больше 150)."""
+    all_articles = []
+    # Начальный URL
+    url = f"{BLOG_URL}/feeds/posts/default?alt=rss&max-results=150"
     page = 1
-    while True:
-        sitemap_url = f"{BLOG_URL}/sitemap.xml?page={page}"
-        print(f"📄 Загружаем sitemap: {sitemap_url}")
+    while url:
+        print(f"📡 Загружаем страницу {page}: {url}")
         try:
-            resp = requests.get(sitemap_url, timeout=10)
+            resp = requests.get(url, timeout=10)
             if resp.status_code != 200:
                 break
-            soup = BeautifulSoup(resp.text, 'xml')
-            locs = soup.find_all('loc')
-            if not locs:
+            root = ET.fromstring(resp.content)
+            # Ищем элементы item
+            items = root.findall('.//item')
+            if not items:
+                items = root.findall('.//entry')
+            if not items:
                 break
-            page_urls = [loc.text for loc in locs if '/post/' in loc.text]
-            if not page_urls:
-                break
-            urls.extend(page_urls)
-            print(f"   Страница {page}: найдено {len(page_urls)} ссылок (всего {len(urls)})")
+            # Обрабатываем каждый item
+            for item in items:
+                title_elem = item.find('title')
+                title = title_elem.text if title_elem is not None else 'Без заголовка'
+                link_elem = item.find('link')
+                link = link_elem.get('href') if link_elem is not None else None
+                if not link:
+                    id_elem = item.find('id')
+                    if id_elem is not None and id_elem.text:
+                        link = id_elem.text
+                if not link:
+                    continue
+                pub_date_elem = item.find('pubDate')
+                if pub_date_elem is not None and pub_date_elem.text:
+                    try:
+                        pub_date = datetime.strptime(pub_date_elem.text, '%a, %d %b %Y %H:%M:%S %z')
+                        date_str = pub_date.isoformat()
+                    except:
+                        date_str = datetime.now().isoformat()
+                else:
+                    date_str = datetime.now().isoformat()
+                desc_elem = item.find('description')
+                content_html = unescape(desc_elem.text) if desc_elem is not None else ''
+                thumb_elem = item.find('media:thumbnail', {'media': 'http://search.yahoo.com/mrss/'})
+                thumbnail = thumb_elem.get('url') if thumb_elem is not None else None
+                if not thumbnail:
+                    img_match = re.search(r'<img[^>]+src="([^">]+)"', content_html)
+                    if img_match:
+                        thumbnail = img_match.group(1)
+                all_articles.append({
+                    'id': f"blogger_{link.split('/')[-2] if link else 'unknown'}",
+                    'source': 'blogger',
+                    'title': title,
+                    'date': date_str,
+                    'content': content_html,
+                    'telegraph_url': link,
+                    'thumbnail': thumbnail,
+                    'description': content_html[:200] if content_html else title
+                })
+            # Ищем ссылку на следующую страницу (в RSS нет стандартной пагинации, но у Blogger есть rel="next")
+            next_link = None
+            for link_elem in root.findall('.//link'):
+                if link_elem.get('rel') == 'next':
+                    next_link = link_elem.get('href')
+                    break
+            url = next_link
             page += 1
-            time.sleep(SITEMAP_DELAY)
-        except Exception as e:
-            print(f"   Ошибка sitemap: {e}")
-            break
-    return urls
-
-def get_article_urls_from_pagination():
-    """Получает URL статей через пагинацию /page/N (запасной вариант)."""
-    urls = []
-    page = 1
-    while True:
-        page_url = f"{BLOG_URL}/page/{page}"
-        print(f"📄 Загружаем страницу пагинации: {page_url}")
-        try:
-            resp = requests.get(page_url, timeout=10)
-            if resp.status_code != 200:
-                break
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            # Ищем ссылки на статьи (обычно содержат /year/month/title.html)
-            links = soup.find_all('a', href=re.compile(r'/\d{4}/\d{2}/[^/?#]+\.html$'))
-            if not links:
-                # Альтернативный паттерн
-                links = soup.find_all('a', href=re.compile(r'/post/[a-zA-Z0-9_-]+'))
-            if not links:
-                break
-            page_urls = list(set([urljoin(BLOG_URL, a['href']) for a in links]))
-            if not page_urls:
-                break
-            urls.extend(page_urls)
-            print(f"   Страница {page}: найдено {len(page_urls)} ссылок (всего {len(urls)})")
-            page += 1
-            time.sleep(0.5)
+            # Небольшая пауза между запросами
+            # time.sleep(REQUEST_DELAY)  # раскомментировать если нужно
         except Exception as e:
             print(f"   Ошибка: {e}")
             break
-    return urls
-
-def get_all_article_urls():
-    """Объединяет все методы для получения максимального количества URL."""
-    # Сначала sitemap (даёт больше всего)
-    urls = get_article_urls_from_sitemap()
-    if not urls:
-        # Если sitemap не дал, пробуем RSS (но только последние 150)
-        urls = get_article_urls_from_rss()
-    # Если всё равно мало, добавляем из пагинации (может дублировать, но для полноты)
-    pag_urls = get_article_urls_from_pagination()
-    for u in pag_urls:
-        if u not in urls:
-            urls.append(u)
-    print(f"✅ Всего уникальных URL статей: {len(urls)}")
-    return urls
-
-def extract_post_data(post_url):
-    """Извлекает данные из страницы статьи."""
-    print(f"📖 Парсим: {post_url}")
-    try:
-        resp = requests.get(post_url, timeout=15)
-        if resp.status_code != 200:
-            print(f"   Ошибка {resp.status_code}, пропускаем")
-            return None
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
-        # Заголовок
-        title_tag = soup.find('h1', class_='post-title') or soup.find('h1', class_='title')
-        if not title_tag:
-            title_tag = soup.find('title')
-        title = title_tag.get_text(strip=True) if title_tag else 'Без заголовка'
-
-        # Дата
-        date_tag = soup.find('time', {'datetime': True})
-        if date_tag:
-            date_str = date_tag['datetime']
-        else:
-            meta_date = soup.find('meta', {'property': 'article:published_time'})
-            date_str = meta_date['content'] if meta_date else datetime.now().isoformat()
-
-        # Контент статьи
-        content_div = soup.find('div', class_='post-body') or soup.find('div', class_='entry-content')
-        if not content_div:
-            content_div = soup.find('div', itemprop='articleBody')
-        content_html = str(content_div) if content_div else ''
-
-        # Первое изображение
-        img_tag = content_div.find('img') if content_div else None
-        thumbnail = None
-        if img_tag and img_tag.get('src'):
-            thumbnail = img_tag['src']
-            if thumbnail.startswith('//'):
-                thumbnail = 'https:' + thumbnail
-            elif thumbnail.startswith('/'):
-                thumbnail = urljoin(BLOG_URL, thumbnail)
-
-        # ID статьи
-        post_id_match = re.search(r'/(\d{4}/\d{2}/[^/?#]+)\.html', post_url)
-        if not post_id_match:
-            post_id_match = re.search(r'/post/([a-zA-Z0-9_-]+)', post_url)
-        post_id = post_id_match.group(1).replace('/', '-') if post_id_match else post_url.split('/')[-2]
-
-        return {
-            'id': f"blogger_{post_id}",
-            'source': 'blogger',
-            'title': title,
-            'date': date_str,
-            'content': content_html,
-            'telegraph_url': post_url,
-            'thumbnail': thumbnail,
-            'description': (content_html[:200] if content_html else title)
-        }
-    except Exception as e:
-        print(f"   Ошибка: {e}")
-        return None
+    # Удаляем дубликаты по ссылке
+    seen = set()
+    unique = []
+    for art in all_articles:
+        if art['telegraph_url'] not in seen:
+            seen.add(art['telegraph_url'])
+            unique.append(art)
+    print(f"✅ Всего уникальных статей: {len(unique)}")
+    return unique
 
 def main():
-    print("🔍 Поиск всех статей...")
-    article_urls = get_all_article_urls()
-    if MAX_ARTICLES and len(article_urls) > MAX_ARTICLES:
-        article_urls = article_urls[:MAX_ARTICLES]
+    print("🔍 Поиск статей через RSS...")
+    articles = get_all_article_urls()
+    if MAX_ARTICLES and len(articles) > MAX_ARTICLES:
+        articles = articles[:MAX_ARTICLES]
         print(f"⚠️ Ограничиваемся первыми {MAX_ARTICLES} статьями.")
-
-    all_posts = []
-    for i, url in enumerate(article_urls, 1):
-        print(f"\n[{i}/{len(article_urls)}]")
-        post_data = extract_post_data(url)
-        if post_data:
-            all_posts.append(post_data)
-        time.sleep(REQUEST_DELAY)
-
+    
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(all_posts, f, ensure_ascii=False, indent=2)
-
-    print(f"\n🎉 Готово! Сохранено {len(all_posts)} статей в {OUTPUT_FILE}")
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n🎉 Готово! Сохранено {len(articles)} статей в {OUTPUT_FILE}")
 
 if __name__ == '__main__':
     main()
