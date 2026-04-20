@@ -1,83 +1,125 @@
+# blogger_parser.py
 import requests
 from bs4 import BeautifulSoup
 import json
 import time
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
+from datetime import datetime
 
 # ========== НАСТРОЙКИ ==========
 BLOG_URL = 'https://sochi-autoparts.blogspot.com'
 OUTPUT_FILE = 'articles.json'
-REQUEST_DELAY = 1.5        # секунд между запросами страниц статей
-MAX_ARTICLES = None        # Ограничить количество (None = все)
+REQUEST_DELAY = 1.0          # секунд между запросами статей
+SITEMAP_DELAY = 0.5          # между запросами страниц sitemap
+MAX_ARTICLES = None          # ограничить количество (None = все)
 # ===============================
 
-def get_article_urls_from_homepage():
-    """Получает список URL статей, парся главную страницу и все страницы архива."""
-    article_urls = []
-    page_num = 1
+def get_article_urls_from_rss():
+    """Получает до 150 последних URL статей через RSS."""
+    rss_url = f"{BLOG_URL}/feeds/posts/default?max-results=150&alt=rss"
+    print(f"📡 Получаем статьи через RSS: {rss_url}")
+    try:
+        resp = requests.get(rss_url, timeout=10)
+        if resp.status_code != 200:
+            print(f"   Ошибка RSS: {resp.status_code}")
+            return []
+        # Парсим XML
+        soup = BeautifulSoup(resp.text, 'xml')
+        links = soup.find_all('link')
+        urls = []
+        for link in links:
+            href = link.get('href')
+            if href and '/post/' in href and href not in urls:
+                urls.append(href)
+        print(f"   ✅ Найдено {len(urls)} статей в RSS")
+        return urls
+    except Exception as e:
+        print(f"   ❌ Ошибка RSS: {e}")
+        return []
+
+def get_article_urls_from_sitemap():
+    """Получает URL статей через sitemap.xml (постранично)."""
+    urls = []
+    page = 1
     while True:
-        # Формируем URL для страницы архива. Если это первая страница, используем основной URL.
-        if page_num == 1:
-            page_url = BLOG_URL
-        else:
-            page_url = f"{BLOG_URL}/search?updated-max=2025-01-01T00:00:00-08:00&max-results=20&start={20 * (page_num - 1)}"
-            # Более простой вариант, который работает почти для всех блогов Blogger:
-            # page_url = f"{BLOG_URL}/page/{page_num}"
-        
-        print(f"📄 Загружаем страницу архива: {page_url}")
+        sitemap_url = f"{BLOG_URL}/sitemap.xml?page={page}"
+        print(f"📄 Загружаем sitemap: {sitemap_url}")
         try:
-            response = requests.get(page_url, timeout=10)
-            if response.status_code != 200:
-                print(f"   Страница {page_num} не найдена (код {response.status_code}), останавливаемся.")
+            resp = requests.get(sitemap_url, timeout=10)
+            if resp.status_code != 200:
                 break
-
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Ищем все ссылки, которые ведут на страницы постов
-            # Обычно это <a> с href, содержащим '/year/month/post-title.html'
-            links = soup.find_all('a', href=re.compile(r'/\d{4}/\d{2}/.+\.html$'))
-            if not links:
-                # Если не нашли по стандартному шаблону, ищем все ссылки, которые не являются внутренними для блога
-                # и не ведут на главную, картинки и т.д.
-                potential_links = soup.find_all('a', href=True)
-                for link in potential_links:
-                    href = link['href']
-                    if href.startswith(BLOG_URL) and '/post/' in href:
-                        links.append(link)
-
-            if not links:
-                print("   Новых ссылок на статьи не найдено. Завершаем.")
+            soup = BeautifulSoup(resp.text, 'xml')
+            locs = soup.find_all('loc')
+            if not locs:
                 break
-
-            new_urls = list(set([urljoin(BLOG_URL, link['href']) for link in links]))
-            article_urls.extend(new_urls)
-            print(f"   Найдено {len(new_urls)} новых ссылок (всего {len(article_urls)})")
-            
-            # Проверяем, есть ли ссылка на следующую страницу
-            next_link = soup.find('a', class_='blog-pager-older-link')
-            if not next_link:
-                print("   Ссылка на следующую страницу не найдена. Завершаем.")
+            page_urls = [loc.text for loc in locs if '/post/' in loc.text]
+            if not page_urls:
                 break
-            
-            page_num += 1
-            # time.sleep(REQUEST_DELAY) # Раскомментируйте, если нужно добавить задержку между страницами
+            urls.extend(page_urls)
+            print(f"   Страница {page}: найдено {len(page_urls)} ссылок (всего {len(urls)})")
+            page += 1
+            time.sleep(SITEMAP_DELAY)
         except Exception as e:
-            print(f"   Ошибка при загрузке страницы {page_num}: {e}")
+            print(f"   Ошибка sitemap: {e}")
             break
-    
-    # Удаляем возможные дубликаты
-    article_urls = list(set(article_urls))
-    return article_urls
+    return urls
+
+def get_article_urls_from_pagination():
+    """Получает URL статей через пагинацию /page/N (запасной вариант)."""
+    urls = []
+    page = 1
+    while True:
+        page_url = f"{BLOG_URL}/page/{page}"
+        print(f"📄 Загружаем страницу пагинации: {page_url}")
+        try:
+            resp = requests.get(page_url, timeout=10)
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            # Ищем ссылки на статьи (обычно содержат /year/month/title.html)
+            links = soup.find_all('a', href=re.compile(r'/\d{4}/\d{2}/[^/?#]+\.html$'))
+            if not links:
+                # Альтернативный паттерн
+                links = soup.find_all('a', href=re.compile(r'/post/[a-zA-Z0-9_-]+'))
+            if not links:
+                break
+            page_urls = list(set([urljoin(BLOG_URL, a['href']) for a in links]))
+            if not page_urls:
+                break
+            urls.extend(page_urls)
+            print(f"   Страница {page}: найдено {len(page_urls)} ссылок (всего {len(urls)})")
+            page += 1
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"   Ошибка: {e}")
+            break
+    return urls
+
+def get_all_article_urls():
+    """Объединяет все методы для получения максимального количества URL."""
+    # Сначала sitemap (даёт больше всего)
+    urls = get_article_urls_from_sitemap()
+    if not urls:
+        # Если sitemap не дал, пробуем RSS (но только последние 150)
+        urls = get_article_urls_from_rss()
+    # Если всё равно мало, добавляем из пагинации (может дублировать, но для полноты)
+    pag_urls = get_article_urls_from_pagination()
+    for u in pag_urls:
+        if u not in urls:
+            urls.append(u)
+    print(f"✅ Всего уникальных URL статей: {len(urls)}")
+    return urls
 
 def extract_post_data(post_url):
-    """Извлекает заголовок, дату, HTML-контент и первую картинку из страницы статьи."""
+    """Извлекает данные из страницы статьи."""
     print(f"📖 Парсим: {post_url}")
     try:
-        response = requests.get(post_url, timeout=15)
-        if response.status_code != 200:
-            print(f"   Ошибка {response.status_code}, пропускаем")
+        resp = requests.get(post_url, timeout=15)
+        if resp.status_code != 200:
+            print(f"   Ошибка {resp.status_code}, пропускаем")
             return None
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(resp.text, 'html.parser')
 
         # Заголовок
         title_tag = soup.find('h1', class_='post-title') or soup.find('h1', class_='title')
@@ -86,12 +128,12 @@ def extract_post_data(post_url):
         title = title_tag.get_text(strip=True) if title_tag else 'Без заголовка'
 
         # Дата
-        date_tag = soup.find('time', {'datetime': True}) or soup.find('span', class_='publishdate')
-        if date_tag and date_tag.get('datetime'):
+        date_tag = soup.find('time', {'datetime': True})
+        if date_tag:
             date_str = date_tag['datetime']
         else:
             meta_date = soup.find('meta', {'property': 'article:published_time'})
-            date_str = meta_date['content'] if meta_date else '1970-01-01T00:00:00Z'
+            date_str = meta_date['content'] if meta_date else datetime.now().isoformat()
 
         # Контент статьи
         content_div = soup.find('div', class_='post-body') or soup.find('div', class_='entry-content')
@@ -99,7 +141,7 @@ def extract_post_data(post_url):
             content_div = soup.find('div', itemprop='articleBody')
         content_html = str(content_div) if content_div else ''
 
-        # Первое изображение (превью)
+        # Первое изображение
         img_tag = content_div.find('img') if content_div else None
         thumbnail = None
         if img_tag and img_tag.get('src'):
@@ -109,8 +151,10 @@ def extract_post_data(post_url):
             elif thumbnail.startswith('/'):
                 thumbnail = urljoin(BLOG_URL, thumbnail)
 
-        # ID статьи из URL
+        # ID статьи
         post_id_match = re.search(r'/(\d{4}/\d{2}/[^/?#]+)\.html', post_url)
+        if not post_id_match:
+            post_id_match = re.search(r'/post/([a-zA-Z0-9_-]+)', post_url)
         post_id = post_id_match.group(1).replace('/', '-') if post_id_match else post_url.split('/')[-2]
 
         return {
@@ -124,14 +168,12 @@ def extract_post_data(post_url):
             'description': (content_html[:200] if content_html else title)
         }
     except Exception as e:
-        print(f"   Ошибка при парсинге: {e}")
+        print(f"   Ошибка: {e}")
         return None
 
 def main():
-    print("🔍 Поиск статей на главной странице и в архивах...")
-    article_urls = get_article_urls_from_homepage()
-    print(f"✅ Найдено всего статей: {len(article_urls)}")
-
+    print("🔍 Поиск всех статей...")
+    article_urls = get_all_article_urls()
     if MAX_ARTICLES and len(article_urls) > MAX_ARTICLES:
         article_urls = article_urls[:MAX_ARTICLES]
         print(f"⚠️ Ограничиваемся первыми {MAX_ARTICLES} статьями.")
